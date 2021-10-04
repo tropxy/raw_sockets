@@ -1,0 +1,7 @@
+version: '3.8'
+services:
+  slac_rust:
+    hostname: slac_rust
+    build:
+      context: ..
+      dockerfile: docker_cross_compiler/Dockerfile
