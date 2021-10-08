@@ -6,23 +6,21 @@ use std::io::ErrorKind;
 use std::io::{self, Error as Errorr};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
-use nix::mount::MsFlags;
-use std::net::TcpStream;
 use std::{convert::TryFrom, convert::TryInto, io::Write};
 
 use bincode;
 use hex_literal::hex;
 use serde::{Deserialize, Serialize};
 
-extern crate nix; // 0.11.0
-
-//use nix::sys::socket::{self, sockopt::ReusePort};
-use nix::sys::socket::{self, setsockopt, *};
+use std::mem;
 use std::{error::Error, net::TcpListener, os::unix::io::AsRawFd};
 
-use std::ffi::OsString;
+use std::thread;
+use std::time::Duration;
 
-use std::mem;
+use nix::sys::{socket::recv, socket::send, socket::MsgFlags};
+
+const NETWORK_IFACE: &str = "eth0";
 
 const CM_SET_KEY_TYPE: u8 = b'\x01';
 //According to 15118-3 this value should be 0x00 and not 0xAA
@@ -34,15 +32,15 @@ const CM_SET_KEY_PMN: u8 = b'\x00';
 const CM_SET_KEY_NEW_EKS: u8 = b'\x01';
 const CM_SET_CCO_CAPAB: u8 = b'\x00';
 
-#[allow(non_camel_case_types)]
-type ioctl_request_t = libc::c_ulong;
-
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_ARP: u16 = 0x0806; // from if_ether.h for SOCK_RAW
 const SIOCGIFADDR: ioctl_request_t = 0x8915;
 const SIOCGIFINDEX: ioctl_request_t = 0x8933;
 const IFNAMSIZ: usize = 16; // net/if.h
 const SIOCGIFHWADDR: ioctl_request_t = 0x8927;
+
+#[allow(non_camel_case_types)]
+type ioctl_request_t = libc::c_ulong;
 
 type MacAddr = [u8; 6];
 
@@ -197,6 +195,64 @@ pub fn socket_send_frame(socket: i32, frame: &[u8], ifindex: i32) -> io::Result<
     }
 }
 
+pub fn bind_to_iface(socket: i32, ifindex: i32) -> Result<String, String> {
+    let sockaddr = libc::sockaddr_ll {
+        sll_family: libc::AF_PACKET as u16,
+        sll_protocol: ETH_P_ALL.to_be(),
+        sll_ifindex: ifindex,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8],
+    };
+
+    let addr_ptr = &sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr;
+    match unsafe {
+        libc::bind(
+            socket,
+            addr_ptr,
+            std::mem::size_of_val(&sockaddr) as libc::socklen_t,
+        )
+    } {
+        -1 => Err("Bind to socket failed".to_string()),
+        _ => Ok("Error on socket bind".to_string()),
+    }
+}
+
+pub fn rcv_frame(socket: i32) {
+    unsafe {
+        let socket =
+            match libc::socket(libc::AF_PACKET, libc::SOCK_RAW, ETH_P_ALL.to_be() as i32) {
+                -1 => Err("Opening socket error"),
+                fd => Ok(fd),
+            }
+            .unwrap();
+
+        let ifindex = ifindex_from_ifname(NETWORK_IFACE, socket).unwrap();
+
+        match bind_to_iface(socket, ifindex) {
+            Err(why) => panic!("{:?}", why),
+            _ => (),
+        }
+        loop {
+            let mut buf: [u8; 1024] = [0; 1024];
+            let mut len: usize;
+            println!("Start waiting for a frame...");
+            match libc::recv(socket, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) {
+                d if d < 0 => {
+                    println!("Error receiving");
+                    d as usize
+                }
+                len => {
+                    println!("Received {:?} bytes", len);
+                    println!("Buffer content: {:x?}", &buf[..len as usize]);
+                    len as usize
+                }
+            };
+        }
+    }
+}
+
 fn main() {
     let set_key_req = SetKeyReq::new([0x33, 0xaa, 0xaa, 0x11, 0xdd, 0xbb, 0x00], [0x00; 16]);
     println!("SetKeyReq nid {:#04x?}", set_key_req.nid);
@@ -220,11 +276,11 @@ fn main() {
 
     println!("opening socket {:?}", listen_socket);
 
-    let ifindex = ifindex_from_ifname("enp0s3", listen_socket).unwrap();
+    let ifindex = ifindex_from_ifname(NETWORK_IFACE, listen_socket).unwrap();
 
     println!("Interface address is {:?}", ifindex);
 
-    let if_hwaddr = ifhwaddr_from_ifname("enp0s3", listen_socket).unwrap();
+    let if_hwaddr = ifhwaddr_from_ifname(NETWORK_IFACE, listen_socket).unwrap();
     println!("IF HW addr is {:x?}", if_hwaddr);
 
     let listen_sockaddr = libc::sockaddr_ll {
@@ -262,8 +318,8 @@ fn main() {
     println!("Frame to send: {:x?}", &frame_to_send_ser);
     println!("Frame length: {:?}", frame_to_send_ser.len());
 
-    let result = socket_send_frame(listen_socket, &frame_to_send_ser, ifindex).unwrap();
-    println!("Result: {:?}", result);
+    //let result = socket_send_frame(listen_socket, &frame_to_send_ser, ifindex).unwrap();
+    //println!("Result: {:?}", result);
     unsafe {
         let addr_ptr = &listen_sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr;
         match libc::sendto(
@@ -279,16 +335,13 @@ fn main() {
         }
     }
 
-    let addr_ptr = &listen_sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr;
-    let bind_result = unsafe {
-        libc::bind(
-            listen_socket,
-            addr_ptr,
-            std::mem::size_of_val(&listen_sockaddr) as libc::socklen_t,
-        )
-    };
+    match bind_to_iface(listen_socket, ifindex) {
+        Err(why) => panic!("{:?}", why),
+        _ => (),
+    }
 
-    println!("bind socket {:?}", bind_result);
+    thread::spawn(move || rcv_frame(listen_socket));
+    thread::sleep(Duration::from_millis(10));
 
     unsafe {
         match libc::send(
@@ -301,6 +354,12 @@ fn main() {
             _ => println!("Successfully sent a Packet"),
         }
     }
+    let mut buf: [u8; 1024] = [0; 1024];
+    let mut len: usize = 0;
+
+    len = recv(listen_socket, &mut buf, MsgFlags::empty()).unwrap();
+    println!("Received {:?} bytes", len);
+
     unsafe {
         match libc::write(
             listen_socket,
@@ -311,4 +370,7 @@ fn main() {
             _ => println!("Success again"),
         }
     }
+
+    println!("Final send");
+    send(listen_socket, &frame_to_send_ser, MsgFlags::empty()).unwrap();
 }
