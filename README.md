@@ -1,3 +1,3 @@
-# rust_slac
+# Raw Sockets in Rust
 
-Rust Implementation of the SLAC Protocol
+A crude example of how to setup a listener and write socket to handle Layer 2 frames in rust
